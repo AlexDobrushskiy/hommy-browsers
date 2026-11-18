@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""plain-chrome — Agent Chrome launched like a person launches it; automation attaches only after the page loaded.
+
+Why: bot walls (Akamai, DataDome) block every Playwright-*launched* Chrome — headed or headless, fresh or
+identity profile — but pass the same Chrome started normally. Playwright's launch switches and its CDP session
+being live during the first load are what they catch. Here Chrome starts with only a debug port; we connect after it has loaded and passed the check,
+then keep driving it over CDP (later navigations pass too: the site's "human" cookie is set by then).
+
+Captcha solves persist and are shared (a person should never have to solve the same wall twice):
+  - Default profile is persistent (HB_STATE_DIR/plain-chrome/shared), not a throwaway temp dir.
+  - If a plain-chrome is already running on the profile, callers get a new TAB in it instead of a
+    second browser (two browsers = two captchas). The browser closes when its last caller releases.
+  - Trust cookies (DataDome, Akamai, Cloudflare, Imperva, PerimeterX — bot-check cookies only, never
+    logins) go to a jar (HB_STATE_DIR/plain-chrome/trust-cookies.db) whenever a plain-chrome closes, and
+    the identity profile's are pulled in at every launch. Every launch seeds its profile from the jar,
+    so a solve in any of these browsers carries to the others.
+
+  plain-chrome fetch [opts] URL [URL ...]
+      Open on the first URL, wait, attach, then visit the rest in the same tab. Per URL: prints one JSON
+      line {url, final, title, blocked, len, eqb...} and saves <out>/<n>.txt (page text), .html, .jpg.
+  plain-chrome open [opts] URL
+      Open and leave it running; prints {"cdp", "port", "target", "profile", "reused"}. Drive it with
+      p.chromium.connect_over_cdp(cdp) and use the page whose CDP targetId == target (other tabs may
+      belong to other agents). Release with `plain-chrome close PORT TARGET`.
+  plain-chrome close PORT [TARGET]
+      Close your tab; the browser closes cleanly (cookies flushed + harvested) once no tabs remain.
+      Without TARGET it closes the whole browser, but only if no one else has a tab in it.
+  plain-chrome show PORT [TARGET]
+      Move the window on-screen and to the front (for the user to solve a captcha); `hide` moves it back.
+  plain-chrome cookies
+      List the trust-cookie jar (site, cookie, expiry).
+
+  opts: --headless          new headless mode (see SKILL.md for which sites accept it); ignored when reusing
+        --profile DIR       use this persistent profile (e.g. the identity profile after `pw-identity acquire`)
+        --fresh             throwaway temp profile (still seeded from the jar); for testing if the IP is flagged
+        --warm URL          load this first (site home page) before the real URLs
+                            (some sites serve their captcha on a cold deep link but not after the home page)
+        --wait S            seconds to let each page settle (default 10; first load 15)
+        --out DIR           where fetch saves files (default ./plain-chrome-out)
+Headed windows open in the background (`open -g`: no focus steal) and off-screen unless --onscreen.
+"""
+import fcntl, hashlib, json, os, re, shutil, socket, sqlite3, subprocess, sys, tempfile, time
+import urllib.parse, urllib.request
+from contextlib import contextmanager
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import hbconfig  # noqa: E402
+
+try:
+    CFG = hbconfig.load()
+except hbconfig.ConfigError as e:
+    sys.exit(f"plain-chrome: config: {e}")
+APP = hbconfig.agent_chrome_app(CFG)
+EXE = hbconfig.agent_chrome_exe(CFG)
+STATE = hbconfig.state(CFG, "plain-chrome")
+SHARED = STATE / "shared"
+JAR = STATE / "trust-cookies.db"
+IDENTITY = hbconfig.profile(CFG, "identity")
+TRUST = re.compile(r"^(datadome|_abck|bm_sz|bm_sv|bm_mi|ak_bmsc|cf_clearance|__cf_bm|reese84|"
+                   r"incap_ses_.*|visid_incap_.*|nlbi_.*|_px.*|__ddg.*|aws-waf-token)$")
+BLOCK = re.compile(r"zugriff verweigert|access denied|captcha-delivery\.com|just a moment|cf-chl|verify you are human|"
+                   r"are you a robot|prove your humanity|pardon our interruption|request unsuccessful|"
+                   r"n[ãa]o a um robot|pas un robot|kein roboter|slide right|deslize para a direita|glissez vers la droite", re.I)
+
+
+def log(msg): print(f"plain-chrome: {msg}", file=sys.stderr, flush=True)
+
+
+# ---------- trust-cookie jar ----------
+
+def _cookie_db(profile): return Path(profile) / "Default" / "Cookies"
+
+
+def _chrome_now(): return int((time.time() + 11644473600) * 1_000_000)
+
+
+def _cols(con): return [r[1] for r in con.execute("PRAGMA table_info(cookies)")]
+
+
+def _trust_rows(db):
+    """Unexpired persistent trust cookies from a Cookies DB (read from a copy: Chrome may hold it)."""
+    if not db.exists(): return []
+    tmp = Path(tempfile.mkdtemp(prefix="pc-ck-"))
+    try:
+        shutil.copy2(db, tmp / "c")
+        j = db.with_name(db.name + "-journal")
+        if j.exists(): shutil.copy2(j, tmp / "c-journal")
+        con = sqlite3.connect(tmp / "c"); cols = _cols(con); now = _chrome_now()
+        rows = [dict(zip(cols, r)) for r in con.execute("select * from cookies")]
+        con.close()
+        return [r for r in rows if TRUST.match(r["name"]) and r.get("has_expires", 1) and r["expires_utc"] > now]
+    except sqlite3.Error as e:
+        log(f"could not read cookies from {db}: {e}"); return []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _merge(rows, db):
+    """Upsert rows into a Cookies DB that no running Chrome uses; newer last_update_utc wins."""
+    con = sqlite3.connect(db); cols = set(_cols(con)); n = 0
+    for r in rows:
+        k = (r["host_key"], r["name"], r["path"])
+        cur = con.execute("select max(last_update_utc) from cookies where host_key=? and name=? and path=?", k).fetchone()[0]
+        if cur is not None and cur >= r["last_update_utc"]: continue
+        keys = [c for c in r if c in cols]
+        try:
+            con.execute("delete from cookies where host_key=? and name=? and path=?", k)
+            con.execute(f"insert into cookies ({','.join(keys)}) values ({','.join('?' * len(keys))})", [r[c] for c in keys])
+            n += 1
+        except sqlite3.Error as e:
+            log(f"skip cookie {k[1]}@{k[0]}: {e}")
+    con.commit(); con.close(); return n
+
+
+def harvest(profile):
+    """Copy a profile's trust cookies into the jar."""
+    db = _cookie_db(profile); rows = _trust_rows(db)
+    if not rows: return 0
+    STATE.mkdir(parents=True, exist_ok=True)
+    if not JAR.exists():  # same schema as Chrome's own DB, emptied
+        shutil.copy2(db, JAR); con = sqlite3.connect(JAR); con.execute("delete from cookies"); con.commit(); con.close()
+    return _merge(rows, JAR)
+
+
+def seed(profile):
+    """Put the jar's cookies into a profile before its Chrome starts."""
+    rows = _trust_rows(JAR)
+    if not rows: return 0
+    db = _cookie_db(profile)
+    if not db.exists():
+        db.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(JAR, db); return len(rows)
+    return _merge(rows, db)
+
+
+# ---------- instances: one browser per profile, one tab per caller ----------
+
+@contextmanager
+def _lock(profile):
+    STATE.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(str(Path(profile).resolve()).encode()).hexdigest()[:12]
+    with open(STATE / f"{key}.lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def _get(port, path, method="GET"):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+    with urllib.request.urlopen(req, timeout=10) as r: return r.read()
+
+
+def _alive(port):
+    try: _get(port, "/json/version"); return True
+    except Exception: return False
+
+
+def _pages(port): return [t for t in json.loads(_get(port, "/json/list")) if t["type"] == "page"]
+
+
+def _instance_file(port): return STATE / f"port-{port}.json"
+
+
+def _running_port(profile):
+    try: port = json.loads((Path(profile) / "plain-chrome.json").read_text())["port"]
+    except Exception: return None
+    return port if _alive(port) else None
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0)); return s.getsockname()[1]
+
+
+def launch(url, profile, headless, onscreen):
+    if not EXE.exists():
+        sys.exit(f"plain-chrome: no Agent Chrome; run {hbconfig.HB_HOME / 'agent-chrome'}")
+    port = free_port()
+    # Mock keychain + basic password store = the cookie encryption Playwright and `pw-identity login` use.
+    # Without them Chrome can't decrypt the identity profile's cookies and drops every login.
+    # Same key in every profile is also what makes jar cookies portable between profiles.
+    args = [f"--user-data-dir={profile}", f"--remote-debugging-port={port}", "--no-first-run",
+            "--no-default-browser-check", "--window-size=1360,900",
+            "--use-mock-keychain", "--password-store=basic"]
+    if headless:
+        args.append("--headless")
+    elif not onscreen:
+        args.append("--window-position=-3000,0")
+    if headless:
+        subprocess.Popen([str(EXE), *args, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    else:  # -g: don't activate (no focus steal), -n: new instance even if another Agent Chrome runs
+        subprocess.run(["open", "-g", "-n", "-a", str(APP), "--args", *args, url], check=True)
+    for _ in range(60):
+        if _alive(port): return port
+        time.sleep(0.5)
+    sys.exit(f"plain-chrome: Chrome did not open its debug port {port}")
+
+
+def start(url, profile, headless, onscreen, temp=False):
+    """Reuse the profile's running browser (new tab) or launch one. Returns (port, target, reused)."""
+    with _lock(profile):
+        port = _running_port(profile)
+        if port:
+            t = json.loads(_get(port, "/json/new?" + urllib.parse.quote(url, safe=""), method="PUT"))
+            return port, t["id"], True
+        if Path(profile).resolve() != IDENTITY.resolve() and IDENTITY.exists():
+            harvest(IDENTITY)
+        n = seed(profile)
+        if n: log(f"seeded {n} trust cookie(s) from the jar")
+        port = launch(url, profile, headless, onscreen)
+        (Path(profile) / "plain-chrome.json").write_text(json.dumps(dict(port=port)))
+        _instance_file(port).write_text(json.dumps(dict(profile=str(profile), temp=temp)))
+        for _ in range(40):
+            pages = _pages(port)
+            if pages: return port, pages[0]["id"], False
+            time.sleep(0.5)
+        sys.exit("plain-chrome: browser opened no tab")
+
+
+def _browser_close(port):
+    """Clean quit (cookies flushed) without attaching anything: SIGTERM to the Chrome that owns the port.
+    Attaching Playwright here (the old way) enables CDP domains on the open page, which bot walls can see
+    (Imperva on coches.net flagged agent Chrome, 11-01)."""
+    out = subprocess.run(["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], capture_output=True, text=True).stdout
+    pids = [int(x) for x in out.split()]
+    for pid in pids:
+        try: os.kill(pid, 15)
+        except ProcessLookupError: pass
+    for _ in range(60):
+        if not _alive(port): return
+        time.sleep(0.25)
+
+
+def release(port, target=None):
+    try: info = json.loads(_instance_file(port).read_text())
+    except Exception: info = {}
+    profile = info.get("profile")
+    with (_lock(profile) if profile else _nolock()):
+        if not _alive(port):
+            _instance_file(port).unlink(missing_ok=True); return
+        pages = _pages(port)
+        if target is None and len(pages) > 1:
+            log(f"{len(pages)} tabs open (other agents?): not closing; pass your TARGET"); return
+        if target and [t for t in pages if t["id"] != target]:
+            try: _get(port, f"/json/close/{target}")  # others still use this browser: close only our tab
+            except Exception: pass
+            return
+        # Last user: close the browser with its tab still open (a windowless Chrome refuses the CDP attach)
+        _browser_close(port)
+        _instance_file(port).unlink(missing_ok=True)
+        if profile:
+            (Path(profile) / "plain-chrome.json").unlink(missing_ok=True)
+            time.sleep(1)
+            n = harvest(profile)
+            if n: log(f"saved {n} trust cookie(s) to the jar")
+            if info.get("temp"): shutil.rmtree(profile, ignore_errors=True)
+
+
+@contextmanager
+def _nolock(): yield
+
+
+def show(port, target=None, on=True):
+    from playwright.sync_api import sync_playwright
+    target = target or _pages(port)[0]["id"]
+    with sync_playwright() as p:
+        b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        s = b.new_browser_cdp_session()
+        wid = s.send("Browser.getWindowForTarget", {"targetId": target})["windowId"]
+        s.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {"windowState": "normal"}})
+        s.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {"left": 80 if on else -3000, "top": 60}})
+        if on:
+            s.send("Target.activateTarget", {"targetId": target})
+            subprocess.run(["osascript", "-e", f'tell application "{APP}" to activate'], check=False)
+
+
+# ---------- commands ----------
+
+def opts(argv):
+    o = dict(headless=False, profile=None, fresh=False, warm=None, wait=10, out="plain-chrome-out", onscreen=False, urls=[])
+    it = iter(argv)
+    for a in it:
+        if a == "--headless": o["headless"] = True
+        elif a == "--onscreen": o["onscreen"] = True
+        elif a == "--fresh": o["fresh"] = True
+        elif a == "--profile": o["profile"] = os.path.expanduser(next(it))
+        elif a == "--warm": o["warm"] = next(it)
+        elif a == "--wait": o["wait"] = float(next(it))
+        elif a == "--out": o["out"] = next(it)
+        else: o["urls"].append(a)
+    if not o["urls"]: sys.exit(__doc__)
+    if o["profile"] and Path(o["profile"]).resolve() == IDENTITY.resolve():
+        log("identity profile — make sure you ran `pw-identity acquire <name>`")
+    return o
+
+
+def profile_for(o):
+    if o["profile"]: return o["profile"], False
+    if o["fresh"]:  # under STATE: the reaper treats it as managed, never as an orphaned throwaway
+        STATE.mkdir(parents=True, exist_ok=True); return tempfile.mkdtemp(dir=STATE, prefix="fresh-"), True
+    SHARED.mkdir(parents=True, exist_ok=True); return str(SHARED), False
+
+
+def report(page, n, out):
+    html = page.content(); text = page.evaluate("document.body ? document.body.innerText : ''")
+    base = Path(out) / f"{n:02d}"
+    base.with_suffix(".txt").write_text(text); base.with_suffix(".html").write_text(html)
+    try: page.screenshot(path=str(base.with_suffix(".jpg")), type="jpeg", quality=60)
+    except Exception: pass
+    m = BLOCK.search(page.title() + " " + text[:3000]) or BLOCK.search(html[:20000])
+    return dict(n=n, final=page.url, title=page.title()[:90], len=len(text),
+                blocked=(m.group(0) if m else ("empty page" if len(text) < 50 else "")),
+                head=re.sub(r"\s+", " ", text)[:160])
+
+
+def find_page(browser, target):
+    for c in browser.contexts:
+        for pg in c.pages:
+            s = c.new_cdp_session(pg)
+            try:
+                if s.send("Target.getTargetInfo")["targetInfo"]["targetId"] == target: return pg
+            finally:
+                s.detach()
+    sys.exit(f"plain-chrome: tab {target} not found")
+
+
+def fetch(o):
+    from playwright.sync_api import sync_playwright
+    profile, temp = profile_for(o)
+    Path(o["out"]).mkdir(parents=True, exist_ok=True)
+    urls = ([o["warm"]] if o["warm"] else []) + o["urls"]
+    port, target, reused = start(urls[0], profile, o["headless"], o["onscreen"], temp)
+    if reused: log(f"reusing the running browser on {profile} (port {port})")
+    time.sleep(max(15, o["wait"]))
+    try:
+        with sync_playwright() as p:
+            b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            page = find_page(b, target)
+            for n, url in enumerate(urls):
+                if n:
+                    try: page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    except Exception as e: print(json.dumps(dict(n=n, url=url, error=str(e)[:150])), flush=True)
+                    time.sleep(o["wait"])
+                r = report(page, n, o["out"]); r["url"] = url
+                print(json.dumps(r, ensure_ascii=False), flush=True)
+    finally:
+        release(port, target)
+
+
+def cookies():
+    for r in sorted(_trust_rows(JAR), key=lambda r: r["host_key"]):
+        exp = time.strftime("%Y-%m-%d", time.localtime(r["expires_utc"] / 1e6 - 11644473600))
+        print(f"{r['host_key']:32} {r['name']:16} until {exp}")
+
+
+def main():
+    if len(sys.argv) < 2: sys.exit(__doc__)
+    cmd, rest = sys.argv[1], sys.argv[2:]
+    if cmd == "fetch":
+        fetch(opts(rest))
+    elif cmd == "open":
+        o = opts(rest); profile, temp = profile_for(o)
+        port, target, reused = start(o["urls"][0], profile, o["headless"], o["onscreen"], temp)
+        print(json.dumps(dict(cdp=f"http://127.0.0.1:{port}", port=port, target=target, profile=profile, reused=reused)))
+    elif cmd == "close":
+        release(int(rest[0]), rest[1] if len(rest) > 1 else None)
+    elif cmd in ("show", "hide"):
+        show(int(rest[0]), rest[1] if len(rest) > 1 else None, on=(cmd == "show"))
+    elif cmd == "cookies":
+        cookies()
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

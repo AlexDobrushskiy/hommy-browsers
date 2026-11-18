@@ -1,0 +1,21 @@
+# Append to ~/.codex/config.toml (default ports: HB_PORT_BASE=8931; see `lib/hbconfig.py ports` for yours). Do NOT also
+# add a stdio `@playwright/mcp` server: by default it drives Google Chrome.app itself (Dock/quit collision with the
+# user's own Chrome).
+[mcp_servers.pw-lane]
+url = "http://localhost:8931/mcp"
+
+[mcp_servers.identity]
+url = "http://localhost:8932/mcp"
+
+# Identity pool: copies of the identity profile (one holder each; logins sync by cookies, Google is master-only).
+[mcp_servers.identity-a]
+url = "http://localhost:8933/mcp"
+
+[mcp_servers.identity-b]
+url = "http://localhost:8934/mcp"
+
+[mcp_servers.identity-c]
+url = "http://localhost:8935/mcp"
+
+[mcp_servers.identity-d]
+url = "http://localhost:8936/mcp"

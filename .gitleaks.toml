@@ -1,0 +1,14 @@
+# gitleaks config for hommy: the default rules, plus paths that are local build or test state (gitignored; never
+# committed) so `gitleaks detect --no-git -s .` on a working tree judges only the repo's own files.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "local build and test state, never committed"
+paths = [
+  '''(^|/)\.git/''',
+  '''(^|/)\.dev/''',
+  '''^bin/''',  # root only, like .gitignore's /bin/ (plugin/bin/ etc. are tracked and scanned)
+  '''^e2e/\.auth/''',
+  '''(^|/)node_modules/''',
+]

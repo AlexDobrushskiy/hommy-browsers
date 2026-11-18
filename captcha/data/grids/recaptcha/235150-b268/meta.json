@@ -1,0 +1,7 @@
+{
+ "instruction": "Select all squares with\nbuses\nIf there are none, click skip",
+ "rows": 4,
+ "cols": 4,
+ "dynamic": false,
+ "table_class": "rc-imageselect-table-44"
+}

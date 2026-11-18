@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""pw-identity — the identity browsers: who holds each, release on idle, the pool of copies, cookie sync.
+
+An identity browser is a persistent Chrome profile with the user's own sign-ins, served to every session by its
+own Playwright MCP server (`serve <browser>`). Chrome allows one live process per profile, so each browser has
+one holder at a time; the pool lets several agents work at once, one per browser. Ports and paths: config.env.
+
+  identity             HB_PORT_BASE+1   HB_IDENTITY_PROFILE               the master (Google lives here only)
+  identity-a …         HB_PORT_BASE+2…  HB_STATE_DIR/identity-pool/<x>    copies of the master (`seed`), one holder
+                                                                          each; HB_POOL of them (0–4)
+
+Logins move between them by cookie sync (Google cookies never: Google logs out a session it sees in several
+profiles; a copy keeps its own Google login, if any):
+  - a copy's Chrome closes → its cookies newer than the master's go into the master (or, while the master's
+    Chrome runs, into a pending store applied right before the master's next launch);
+  - a copy's Chrome launches → it first pulls the master's (+ pending) newer cookies.
+So a login an agent makes in identity-b reaches the master and every copy's next launch. Only cookies sync:
+a site that keeps its login in localStorage needs that login made on the master (or a fresh `seed`).
+All profiles use Chrome's mock keychain (Playwright's default; plain-chrome and `login` pass
+--use-mock-keychain), so encrypted cookie values are portable between them.
+
+The hooks keep a lease per browser: the holder is the session that last called an `mcp__<browser>__*`
+tool while its Chrome was up. A detached reaper closes the Chrome once it has been idle for TTL seconds
+with no call in flight; the next call (any session) relaunches it on the same profile, cookies intact.
+Another session's call against a busy holder is blocked (naming the free pool browsers); against an idle
+holder it reaps first and proceeds.
+
+  pw-identity [-b <browser>] status        free | held by <session> (<cwd>), idle Ns, k call(s) in flight
+  pw-identity pool                         status of every identity browser + seed age
+  pw-identity [-b <browser>] release [--force]   close it now (own / idle / orphaned holder; --force: any)
+  pw-identity [-b <browser>] login [url ...]     a plain, non-automated Chrome on the profile for signing in
+                                           (Google refuses sign-in from automation-controlled Chrome)
+  pw-identity acquire <name> [--any | --pool | -b <browser>]
+                                           for a script that launches its own Chrome on a profile (Playwright
+                                           launch_persistent_context / plain-chrome --profile): frees an idle holder,
+                                           records "script:<name>" as holder, syncs cookies in; exit 1 if busy.
+                                           --any: a free copy, else the master, else an idle-held copy. --pool: copies only.
+                                           Prints "acquired <browser> for <name>", then the profile path. The hold
+                                           ends (and the copy's cookies sync out) when that Chrome exits.
+  pw-identity seed <x|identity-x|--all|--unseeded|--stale [hours]>
+                                           fresh full copy of the master's profile onto pool browser(s), minus its
+                                           Google session; works while the master's Chrome runs (file clones; a hot
+                                           SQLite journal is rolled back on open). --stale: idle copies seeded more
+                                           than PW_IDENTITY_RESEED_HOURS (24) ago. --unseeded: copies never seeded.
+                                           Without a master profile there is nothing to copy: exit 0, says so.
+  pw-identity sync [<browser>|--all]       run the cookie sync now (closed browsers only)
+  pw-identity hook pre|post                PreToolUse / PostToolUse(+Failure) on the identity tools: mcp__identity__*,
+                                           mcp__identity-<x>__* and the plugin's mcp__plugin_hommy-browsers_identity…__*
+"""
+import fcntl, json, os, re, shutil, signal, sqlite3, subprocess, sys, tempfile, time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "lib"))
+import hbconfig  # noqa: E402
+
+try:
+    CFG = hbconfig.load()
+except hbconfig.ConfigError as e:
+    sys.exit(f"pw-identity: config: {e}")
+MASTER = "identity"
+POOL = hbconfig.pool(CFG)
+POOL_DIR = hbconfig.state(CFG, "identity-pool")
+PENDING = POOL_DIR / "pending-cookies.db"
+PORTS = {name: port for name, port, _ in hbconfig.servers(CFG) if name != "lanes"}
+SELF = HERE / "pw-identity"
+PLUGIN_PREFIX = "plugin_hommy-browsers_"     # MCP servers the plugin registers: mcp__plugin_hommy-browsers_<name>__*
+TTL = int(os.environ.get("PW_IDENTITY_TTL", 180))           # idle seconds before the reaper closes it
+INFLIGHT_MAX = int(os.environ.get("PW_IDENTITY_INFLIGHT_MAX", 600))  # a call without its Post is dropped then
+RESEED_HOURS = float(os.environ.get("PW_IDENTITY_RESEED_HOURS", 24))
+ACQUIRE_GRACE = 60                                           # a script holder may take this long to start Chrome
+LOGIN = "login"                                              # holder id of a manual-login Chrome
+# Not copied by `seed`: locks of the source's Chrome, caches, and the open-tab session.
+SEED_SKIP_TOP = {"SingletonLock", "SingletonCookie", "SingletonSocket", "GPUCache", "GrShaderCache",
+                 "ShaderCache", "GPUPersistentCache", "GraphiteDawnCache", "component_crx_cache",
+                 "extensions_crx_cache", "BrowserMetrics", "BrowserMetrics-spare.pma", "Crashpad",
+                 "RunningChromeVersion", "plain-chrome.json",
+                 # on-device models (~4.4 GB on the master, 2026-11-01): Chrome re-downloads them if it wants them
+                 "OptGuideManifestModel", "optimization_guide_model_store", "OnDeviceHeadSuggestModel",
+                 "WasmTtsEngine"}
+GOOGLE_COOKIES = "host_key like '%google.%' or host_key like '%youtube.com' or host_key like '%gmail.com'"
+GOOGLE_URL = re.compile(r"https?://([a-z0-9-]+\.)*(google\.[a-z.]+|gmail\.com|youtube\.com)(/|$|\?)", re.I)
+SEED_SKIP_DEFAULT = {"Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache", "Sessions",
+                     "Sessions_Encrypted", "Current Session", "Current Tabs", "Last Session", "Last Tabs",
+                     "LOCK", "Shared Dictionary"}
+# Inside Default: caches nobody needs in a copy (Service Worker caches: 7k files; Google's own IndexedDB blobs).
+SEED_SKIP_PATHS = {"Service Worker/CacheStorage", "Service Worker/ScriptCache"}
+SEED_SKIP_GLOBS = ["IndexedDB/https_*google.com_*", "IndexedDB/https_*youtube.com_*"]
+KEY = ["host_key", "top_frame_site_key", "has_cross_site_ancestor", "name", "path", "source_scheme", "source_port"]
+
+
+def normalize(name):
+    name = name.strip()
+    if name in ("", "master"):
+        return MASTER
+    if len(name) == 1:
+        name = f"identity-{name}"
+    if name not in PORTS:
+        sys.exit(f"unknown identity browser {name!r}: {', '.join([MASTER, *POOL])} (HB_POOL={len(POOL)})")
+    return name
+
+
+def profile(b):
+    return hbconfig.profile(CFG, b)
+
+
+def by_profile(path):
+    """The identity browser whose profile is `path`, or None."""
+    real = os.path.realpath(path)
+    for b in PORTS:
+        if os.path.realpath(profile(b)) == real:
+            return b
+    return None
+
+
+def now():
+    return int(time.time())
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def owned_outside(h):
+    """A holder whose Chrome agents don't manage: a login window, a script's own Chrome, or a seed copy."""
+    return bool(h) and (h["session"] == LOGIN or h["session"].startswith(("script:", "seed:")))
+
+
+def pending(h):
+    """A holder that has no Chrome yet but must not be taken over: a running seed, a script still launching."""
+    if not h:
+        return False
+    if h["session"].startswith("seed:"):
+        return alive(h.get("pid", 0))
+    return h["session"].startswith("script:") and now() - h.get("since", 0) < ACQUIRE_GRACE
+
+
+def chrome_pids():
+    """{profile path: main Chrome pid} for every Chrome (Agent Chrome, Playwright's, any) with --user-data-dir."""
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    found = {}
+    for line in out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if "/Contents/MacOS/Google Chrome" not in cmd and "/chrome " not in cmd or "--type=" in cmd:
+            continue
+        m = re.search(r"--user-data-dir=(.+?)(?= --|$)", cmd)
+        if m:
+            found[os.path.realpath(m.group(1).strip())] = int(pid)
+    return found
+
+
+def chrome_pid(b):
+    return chrome_pids().get(os.path.realpath(profile(b)))
+
+
+class Lease:
+    """flock-guarded state of one browser; the kernel drops the lock if the holder dies."""
+
+    def __init__(self, b, wait=10):
+        self.b, self.wait = b, wait
+        self.dir = Path(str(profile(b)) + ".lease")
+
+    def __enter__(self):
+        (self.dir / "inflight").mkdir(parents=True, exist_ok=True)
+        self.fd = open(self.dir / "lock", "a")
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() > deadline:
+                    self.fd.close()
+                    raise TimeoutError(f"{self.b} lease lock busy")
+                time.sleep(0.05)
+
+    def __exit__(self, *a):
+        self.fd.close()
+
+    def _put(self, name, text):
+        tmp = self.dir / f".{name}.{os.getpid()}"
+        tmp.write_text(text)
+        tmp.replace(self.dir / name)
+
+    def _int(self, name):
+        try:
+            return int((self.dir / name).read_text())
+        except Exception:
+            return 0
+
+    @property
+    def holder(self):
+        try:
+            return json.loads((self.dir / "holder").read_text())
+        except Exception:
+            return None
+
+    @holder.setter
+    def holder(self, h):
+        if h is None:
+            (self.dir / "holder").unlink(missing_ok=True)
+        else:
+            self._put("holder", json.dumps(h))
+
+    def last_use(self):
+        return self._int("last-use")
+
+    def stamp(self):
+        self._put("last-use", str(now()))
+
+    def seeded_at(self):
+        return self._int("seeded-at")
+
+    def inflight(self):
+        n = 0
+        for f in (self.dir / "inflight").iterdir():
+            if now() - int(f.stat().st_mtime) > INFLIGHT_MAX:
+                f.unlink(missing_ok=True)
+            else:
+                n += 1
+        return n
+
+    def idle_for(self):
+        return now() - self.last_use()
+
+    def takeable(self):
+        """Its Chrome (if any) may be closed by someone else: no holder, or an idle agent holder."""
+        h = self.holder
+        if not h:
+            return True
+        if owned_outside(h):
+            return False
+        return self.inflight() == 0 and self.idle_for() >= TTL
+
+    def clear(self):
+        self.holder = None
+        for f in (self.dir / "inflight").iterdir():
+            f.unlink(missing_ok=True)
+
+
+class FileLock:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = open(self.path, "a")
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        self.fd.close()
+
+
+def log(msg):
+    try:
+        with open(POOL_DIR / "sync.log", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+# ---------- cookie sync ----------
+
+def chrome_now():
+    return int((time.time() + 11644473600) * 1_000_000)
+
+
+def cookie_db(b):
+    return profile(b) / "Default" / "Cookies"
+
+
+def snapshot(db):
+    """Copy a (maybe live) Cookies DB + its journal to a temp dir; SQLite rolls a hot journal back on open."""
+    tmp = Path(tempfile.mkdtemp(prefix="pwid-ck-"))
+    shutil.copy2(db, tmp / "Cookies")
+    j = Path(str(db) + "-journal")
+    if j.exists():
+        shutil.copy2(j, tmp / "Cookies-journal")
+    return tmp
+
+
+def merge_cookies(src, dst, create=False, baseline=None):
+    """Upsert src's non-Google, unexpired cookies into dst where src's copy is newer (last_update_utc) than
+    dst's (and than `baseline`'s, a Cookies DB such as the live master's). dst must not be open in a running
+    Chrome. Returns the number of rows written."""
+    if not Path(src).exists() or (not create and not Path(dst).exists()):
+        return 0
+    snap = snapshot(src)
+    base = snapshot(baseline) if baseline and Path(baseline).exists() else None
+    try:
+        c = sqlite3.connect(dst, timeout=10)
+        try:
+            c.execute("attach database ? as s", (str(snap / "Cookies"),))
+            if create:
+                c.execute("create table if not exists main.cookies as select * from s.cookies where 0")
+                for (sql,) in c.execute("select sql from s.sqlite_master where type='index' and sql is not null"
+                                        ).fetchall():
+                    c.execute(sql.replace("CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS", 1))
+            cols = [r[1] for r in c.execute("pragma main.table_info(cookies)")]
+            scols = {r[1] for r in c.execute("pragma s.table_info(cookies)")}
+            if set(cols) != scols or not set(KEY) <= scols:
+                log(f"schema differs: {src} → {dst}; skipped")
+                return 0
+            collist = ", ".join(cols)
+            same = " and ".join(f"d.{k} = x.{k}" for k in KEY)
+            g = GOOGLE_COOKIES.replace("host_key", "x.host_key")
+            newer_than_base = ""
+            if base:
+                c.execute("attach database ? as b", (str(base / "Cookies"),))
+                newer_than_base = (f"and not exists (select 1 from b.cookies d where {same} "
+                                   f"and d.last_update_utc >= x.last_update_utc)")
+            before = c.total_changes
+            c.execute(f"""insert or replace into main.cookies ({collist})
+                          select {", ".join("x." + k for k in cols)} from s.cookies x
+                          where not ({g}) and (x.has_expires = 0 or x.expires_utc > ?)
+                            and not exists (select 1 from main.cookies d where {same}
+                                            and d.last_update_utc >= x.last_update_utc)
+                            {newer_than_base}""", (chrome_now(),))
+            c.commit()
+            return c.total_changes - before
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(snap, ignore_errors=True)
+        if base:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+def apply_pending():
+    """Pending store → master. Caller holds the master's lease and has checked its Chrome is not running."""
+    with FileLock(POOL_DIR / "pending.lock"):
+        if not PENDING.exists():
+            return 0
+        n = merge_cookies(PENDING, cookie_db(MASTER))
+        PENDING.unlink(missing_ok=True)
+    if n:
+        log(f"pending → master: {n} cookie(s)")
+    return n
+
+
+def push(b):
+    """A closed copy's cookies → master if its Chrome is down (else → pending). Caller holds b's lease."""
+    src = cookie_db(b)
+    if b == MASTER or not src.exists():
+        return
+    try:
+        with Lease(MASTER, wait=2) as lm:
+            # inflight: a pre hook just let a call through that is about to launch the master's Chrome
+            if not chrome_pid(MASTER) and not pending(lm.holder) and lm.inflight() == 0:
+                apply_pending()
+                n = merge_cookies(src, cookie_db(MASTER))
+                if n:
+                    log(f"{b} → master: {n} cookie(s)")
+                return
+    except TimeoutError:
+        pass
+    with FileLock(POOL_DIR / "pending.lock"):
+        n = merge_cookies(src, PENDING, create=True, baseline=cookie_db(MASTER))
+    if n:
+        log(f"{b} → pending (master busy): {n} cookie(s)")
+
+
+def pull(b):
+    """Master (+ pending) cookies newer than the copy's → the copy. Copy's Chrome must be down."""
+    dst = cookie_db(b)
+    if b == MASTER or not dst.exists():
+        return
+    n = merge_cookies(cookie_db(MASTER), dst)
+    with FileLock(POOL_DIR / "pending.lock"):
+        if PENDING.exists():
+            n += merge_cookies(PENDING, dst)
+    if n:
+        log(f"master → {b}: {n} cookie(s)")
+
+
+def on_closed(b):
+    """b's Chrome just exited (caller holds b's lease)."""
+    try:
+        if b == MASTER:
+            apply_pending()
+        else:
+            push(b)
+    except Exception as e:
+        log(f"on_closed {b}: {e!r}")
+
+
+def before_launch(b):
+    """b's Chrome is about to start (caller holds b's lease, no Chrome on it)."""
+    try:
+        if b == MASTER:
+            apply_pending()
+        else:
+            push(b)              # catch up a close nobody synced (crash, reboot)
+            pull(b)
+    except Exception as e:
+        log(f"before_launch {b}: {e!r}")
+
+
+# ---------- holders ----------
+
+def kill(pid):
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(12):
+            time.sleep(0.5)
+            os.kill(pid, 0)
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    time.sleep(0.5)              # let the profile's files settle before a sync reads/writes them
+
+
+def describe(h):
+    if not h:
+        return "an unknown session"
+    if h["session"] == LOGIN:
+        return "a manual-login window"
+    if h["session"].startswith("script:"):
+        return f"the script {h['session'][7:]} (its own Chrome)"
+    if h["session"].startswith("seed:"):
+        return f"a seed copy ({h['session'][5:]})"
+    return f"session {h['session'][:8]} ({h.get('cwd', '?')})"
+
+
+def free_pool(exclude=()):
+    """Pool browsers nobody holds right now (no Chrome, no pending holder). Lock-free: hooks call it while
+    holding their own browser's lock."""
+    pids, free = chrome_pids(), []
+    for b in POOL:
+        l = Lease(b)
+        if b not in exclude and os.path.realpath(profile(b)) not in pids and l.seeded_at() and not pending(l.holder):
+            free.append(b)
+    return free
+
+
+def ran_since(b, t):
+    """A Chrome wrote b's profile at or after unix time t (it starts/stops there)."""
+    for f in ("Local State", "Default/Preferences"):   # not Cookies: the pre-launch pull writes it
+        try:
+            if (profile(b) / f).stat().st_mtime >= t:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def arm_reaper(b):
+    # Under the lease: a reaper decides to exit under the same lock, so a live pidfile here means that reaper
+    # will still see this new holder (no gap where neither watches; seen 2026-11-01).
+    with Lease(b) as l:
+        pidfile = l.dir / "reaper"
+        try:
+            if alive(pidfile.read_text()):
+                return
+        except Exception:
+            pass
+        p = subprocess.Popen([sys.executable, __file__, "reaper", b], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        pidfile.write_text(str(p.pid))
+
+
+def reaper(b):
+    """Watch b until nothing holds it: each round ends when the current holder's Chrome is gone."""
+    while True:
+        reap_round(b)
+        time.sleep(0.5)
+        with Lease(b) as l:
+            if not l.holder and not chrome_pid(b) and l.inflight() == 0:
+                (l.dir / "reaper").unlink(missing_ok=True)
+                return
+
+
+def reap_round(b):
+    seen = False                             # a script holder's Chrome has started
+    while True:
+        pid = chrome_pid(b)
+        h = Lease(b).holder
+        if h and h["session"].startswith("script:"):
+            # A short-lived Chrome can start and exit between two polls: Chrome writes Local State /
+            # Preferences at shutdown, so a profile written since the hold began also means "it ran".
+            seen = seen or bool(pid) or ran_since(b, h.get("since", 0))
+            if not pid and (seen or now() - h.get("since", 0) >= ACQUIRE_GRACE):
+                time.sleep(1)
+                with Lease(b) as l:          # the script's Chrome exited (or never came): the hold ends
+                    if l.holder == h:
+                        l.clear()
+                    if seen and not chrome_pid(b):
+                        on_closed(b)
+                return
+            time.sleep(0.3)
+            continue
+        if not pid:
+            with Lease(b) as l:
+                launching = l.inflight() > 0         # the pre hook runs before the tool launches Chrome
+                hh = l.holder
+                if not launching:
+                    if hh and (hh["session"] == LOGIN or not owned_outside(hh)):
+                        l.clear()
+                    if not (hh and hh["session"].startswith("seed:")):
+                        on_closed(b)
+            if not launching:
+                return
+            time.sleep(1)
+            continue
+        with Lease(b) as l:
+            h = l.holder
+            if h and h["session"] == LOGIN:
+                pass                         # the user closes it; keep watching so the close gets synced
+            elif owned_outside(h):
+                time.sleep(2)                # a script/seed: wait for its Chrome to exit (handled above)
+                continue
+            else:
+                due = 0 if l.inflight() == 0 and l.idle_for() >= TTL else max(1, TTL - l.idle_for())
+                if due == 0:
+                    kill(pid)
+                    l.clear()
+                    on_closed(b)
+                    return
+                time.sleep(min(due, 5))
+                continue
+        time.sleep(2)
+
+
+def others_hint(b, prefix=""):
+    free = free_pool(exclude=(b,))
+    if free:
+        return f" Free now: {', '.join(free)} — use those tools (mcp__{prefix}{free[0]}__*) instead."
+    return " No pool browser is free right now either."
+
+
+def browser_of(tool):
+    """(identity browser, MCP server prefix) of a tool name, e.g. mcp__plugin_hommy-browsers_identity-a__x."""
+    parts = tool.split("__")
+    if len(parts) < 3 or parts[0] != "mcp":
+        return None, ""
+    server, prefix = parts[1], ""
+    if server.startswith(PLUGIN_PREFIX):
+        server, prefix = server[len(PLUGIN_PREFIX):], PLUGIN_PREFIX
+    return server, prefix
+
+
+def hook(sub):
+    ev = json.load(sys.stdin)
+    me, tid, tool = ev.get("session_id", "?"), ev.get("tool_use_id", ""), ev.get("tool_name", "")
+    b, prefix = browser_of(tool)
+    if b not in PORTS:
+        return
+    with Lease(b) as l:
+        pid, h = chrome_pid(b), l.holder
+        if sub == "pre":
+            url = str((ev.get("tool_input") or {}).get("url", ""))
+            if b != MASTER and tool.endswith("browser_navigate") and GOOGLE_URL.match(url):
+                sys.stderr.write(f"Google is master-only: copies carry no Google session (Google logs out a session "
+                                 f"shared by several profiles). Use the master `identity` (mcp__{prefix}identity__*) for "
+                                 f"{url[:60]}, one step, then browser_close.\n")
+                sys.exit(2)
+            if b != MASTER and not l.seeded_at():
+                sys.stderr.write(f"{b} has no copy of the master's logins yet. Run "
+                                 f"`{SELF} seed {b}`, or use another one.{others_hint(b, prefix)}\n")
+                sys.exit(2)
+            # held: its Chrome runs, or a holder is about to start one (a pending script/seed, or another
+            # session's call already let through and still in flight)
+            if (pid or pending(h) or l.inflight()) and h and h["session"] != me:
+                if owned_outside(h):
+                    sys.stderr.write(f"{b} is held by {describe(h)}. Wait until it closes (check: "
+                                     f"{SELF} -b {b} status), then retry. Don't close it "
+                                     f"yourself.{others_hint(b, prefix)}\n")
+                    sys.exit(2)
+                busy, idle = l.inflight(), l.idle_for()
+                if busy or idle < TTL:
+                    wait = INFLIGHT_MAX if busy else TTL - idle
+                    sys.stderr.write(
+                        f"{b} is held by {describe(h)}, last used {idle}s ago, {busy} call(s) in flight. "
+                        f"It frees itself after {TTL}s idle (≤ ~{wait}s from now) or when that session calls "
+                        f"browser_close. Don't force-release it.{others_hint(b, prefix)}\n")
+                    sys.exit(2)
+                if pid:
+                    kill(pid)                # idle holder: take over
+                    on_closed(b)
+                    pid = None
+                l.clear()
+            if not pid:
+                before_launch(b)             # this call (re)starts its Chrome
+            if not pid or not h or h["session"] != me:
+                l.holder = {"session": me, "cwd": ev.get("cwd", ""), "since": now()}
+            if tid:
+                (l.dir / "inflight" / tid).write_text(str(now()))
+            l.stamp()
+        else:
+            if tid:
+                (l.dir / "inflight" / tid).unlink(missing_ok=True)
+            if h and h["session"] == me:
+                l.stamp()
+                if tool.endswith("browser_close"):
+                    l.clear()
+    arm_reaper(b)
+
+
+def take(l, b, holder):
+    """Under l's lock: make b free for `holder` (reap an idle Chrome). Returns an error string or None."""
+    pid, h = chrome_pid(b), l.holder
+    if pending(h) or (pid and not l.takeable()):
+        return f"{b} busy: held by {describe(h)}"
+    if pid:
+        kill(pid)
+        on_closed(b)
+    l.clear()
+    l.holder = holder
+    return None
+
+
+# ---------- seed ----------
+
+def copy_profile(src, dst):
+    """APFS clonefile copy of src into a fresh dst (metadata only), minus caches, locks, open tabs."""
+    (dst / "Default").mkdir(parents=True)
+    for entry in os.scandir(src):
+        if entry.name in SEED_SKIP_TOP or entry.name.endswith(".lease"):
+            continue
+        if entry.name == "Default":
+            for sub in os.scandir(entry.path):
+                if sub.name in SEED_SKIP_DEFAULT:
+                    continue
+                if sub.name in ("Service Worker", "IndexedDB"):
+                    (dst / "Default" / sub.name).mkdir()
+                    for leaf in os.scandir(sub.path):
+                        rel = f"{sub.name}/{leaf.name}"
+                        if rel in SEED_SKIP_PATHS or any(Path(rel).match(g) for g in SEED_SKIP_GLOBS):
+                            continue
+                        subprocess.run(["cp", "-a", "-c", leaf.path, str(dst / "Default" / sub.name)], check=True)
+                    continue
+                subprocess.run(["cp", "-a", "-c", sub.path, str(dst / "Default")], check=True)
+        else:
+            subprocess.run(["cp", "-a", "-c", entry.path, str(dst)], check=True)
+    # leveldb stores (Local Storage, IndexedDB…) carry their own LOCK files: drop the copied ones
+    for lock in dst.rglob("LOCK"):
+        if lock.is_file() and lock.stat().st_size == 0:
+            lock.unlink()
+
+
+def keep_own_google(new, old):
+    """In the fresh copy `new`, swap the master's Google cookies for the old copy's own (if any)."""
+    db = new / "Default" / "Cookies"
+    if not db.exists():
+        return
+    c = sqlite3.connect(db)
+    try:
+        c.execute(f"delete from cookies where {GOOGLE_COOKIES}")
+        own = old / "Default" / "Cookies"
+        if own.exists():
+            c.execute("attach database ? as own", (str(own),))
+            try:
+                c.execute(f"insert or replace into cookies select * from own.cookies where {GOOGLE_COOKIES}")
+            except sqlite3.Error:
+                pass                         # schema changed with a Chrome update: the copy starts without Google
+        c.commit()
+    finally:
+        c.close()
+
+
+def seed(b):
+    """Fresh copy of the master's profile onto pool browser b. Returns None or the reason it didn't.
+    The master's Chrome may be running (APFS clones are near-instant; SQLite rolls back a hot journal)."""
+    mark = {"session": f"seed:{b}", "pid": os.getpid(), "since": now()}
+    with Lease(b) as lb:
+        err = take(lb, b, mark)
+        if err:
+            return err
+        push(b)                              # don't lose logins made in the old copy
+    src, dst = profile(MASTER), profile(b)
+    tmp, old = dst.with_name(f".{dst.name}.seed-tmp"), dst.with_name(f".{dst.name}.old")
+    try:
+        for p in (tmp, old):
+            shutil.rmtree(p, ignore_errors=True)
+        copy_profile(src, tmp)
+        keep_own_google(tmp, dst)
+        with FileLock(POOL_DIR / "pending.lock"):
+            if PENDING.exists():
+                merge_cookies(PENDING, tmp / "Default" / "Cookies")
+        if dst.exists():
+            dst.rename(old)
+        tmp.rename(dst)
+        shutil.rmtree(old, ignore_errors=True)
+        with Lease(b) as lb:
+            lb._put("seeded-at", str(now()))
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        with Lease(b) as l:
+            if l.holder == mark:
+                l.clear()
+
+
+def seed_cmd(args):
+    POOL_DIR.mkdir(parents=True, exist_ok=True)
+    if not args:
+        sys.exit("usage: pw-identity seed <x|identity-x|--all|--unseeded|--stale [hours]>")
+    if not (profile(MASTER) / "Default").is_dir():
+        print(f"no master profile yet ({profile(MASTER)}): nothing to seed")
+        return
+    if args[0] == "--unseeded":
+        targets = []
+        for b in POOL:
+            with Lease(b) as l:
+                if not l.seeded_at():
+                    targets.append(b)
+    elif args[0] == "--stale":
+        hours = float(args[1]) if len(args) > 1 else RESEED_HOURS
+        targets = []
+        for b in POOL:
+            with Lease(b) as l:
+                if now() - l.seeded_at() > hours * 3600:
+                    targets.append(b)
+    elif args[0] == "--all":
+        targets = POOL
+    else:
+        targets = [normalize(a) for a in args]
+        if MASTER in targets:
+            sys.exit("the master is the source; seed a pool browser")
+    rc = 0
+    for b in targets:
+        t0 = time.monotonic()
+        err = seed(b)
+        if err:
+            print(f"{b}: not seeded — {err}")
+            rc = 1
+        else:
+            print(f"{b}: seeded from {profile(MASTER)} in {time.monotonic() - t0:.1f}s")
+    sys.exit(rc)
+
+
+def sync_cmd(args):
+    targets = POOL + [MASTER] if not args or args[0] == "--all" else [normalize(a) for a in args]
+    for b in targets:
+        with Lease(b) as l:
+            if chrome_pid(b) or pending(l.holder):
+                print(f"{b}: running, skipped (syncs when its Chrome closes)")
+                continue
+            before_launch(b) if b != MASTER else on_closed(b)
+            print(f"{b}: synced")
+
+
+def status_line(b, l, pid):
+    h = l.holder
+    if not pid:
+        if pending(h):
+            return f"pending: {describe(h)}"
+        if h and l.inflight():
+            return f"held: no chrome yet, by {describe(h)}, {l.inflight()} call(s) in flight"
+        return "free"
+    idle = (f"for {now() - h['since']}s" if owned_outside(h) else
+            f"idle {l.idle_for()}s" if l.last_use() else "never used via hooks")
+    return f"held: chrome pid {pid} by {describe(h)}, {idle}, {l.inflight()} call(s) in flight"
+
+
+def agent_chrome():
+    return subprocess.run([str(HERE / "agent-chrome"), "--no-update"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def main():
+    args = sys.argv[1:]
+    b = MASTER
+    for flag in ("-b", "--browser"):
+        if flag in args:
+            i = args.index(flag)
+            b = normalize(args[i + 1])
+            del args[i:i + 2]
+    cmd = args[0] if args else "status"
+    args = args[1:]
+    if cmd == "reaper":
+        return reaper(normalize(args[0]) if args else MASTER)
+    if cmd == "hook":
+        return hook(args[0])
+    if cmd == "seed":
+        return seed_cmd(args)
+    if cmd == "sync":
+        return sync_cmd(args)
+    if cmd == "which":                       # helper for scripts: the browser name of a profile path
+        print(by_profile(args[0]) or "")
+        return
+    if cmd == "pool":
+        for x in [MASTER, *POOL]:
+            with Lease(x) as l:
+                age = "master" if x == MASTER else (
+                    f"seeded {(now() - l.seeded_at()) / 3600:.1f}h ago" if l.seeded_at() else "never seeded")
+                print(f"{x:11} :{PORTS[x]}  {age:20} {status_line(x, l, chrome_pid(x))}")
+        return
+    if cmd == "acquire":
+        if not args or args[0].startswith("-"):
+            sys.exit("usage: pw-identity acquire <name> [--any | --pool | -b <browser>]")
+        name, holder = args[0], {"session": f"script:{args[0]}", "since": now()}
+        candidates = [b]
+        if "--pool" in args or "--any" in args:      # truly free ones first, then idle holders
+            free = free_pool()
+            candidates = free + [x for x in POOL if x not in free]
+            if "--any" in args:    # copies first: keep the master free for Google / localStorage-login steps
+                candidates = free + [MASTER] + [x for x in POOL if x not in free]
+        errs = []
+        for x in candidates:
+            with Lease(x) as l:
+                if x != MASTER and not l.seeded_at():
+                    errs.append(f"{x} never seeded")
+                    continue
+                err = take(l, x, holder)
+                if not err:
+                    before_launch(x)
+            if not err:
+                arm_reaper(x)
+                print(f"acquired {x} for {name}")
+                print(profile(x))
+                return
+            errs.append(err)
+        sys.exit("busy: " + "; ".join(errs) + " — retry later")
+    me = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    with Lease(b) as l:
+        pid, h = chrome_pid(b), l.holder
+        if cmd == "status":
+            print(status_line(b, l, pid))
+            if pid:
+                sys.exit(0 if not h or h["session"] == me or owned_outside(h) else 1)
+            return
+        if cmd == "release":
+            if not pid:
+                if h and not (h["session"].startswith("seed:") and pending(h)):
+                    l.clear()                # a hold without a Chrome (a script that already quit)
+                print("free")
+                return
+            idle = l.inflight() == 0 and l.idle_for() >= TTL
+            if h and h["session"] not in (me,) and not idle and "--force" not in args:
+                sys.exit(f"not released: held by {describe(h)}, idle {l.idle_for()}s (use --force)")
+            kill(pid)
+            l.clear()
+            on_closed(b)
+            print(f"released: chrome pid {pid}")
+            return
+        if cmd == "login":
+            if (pid and h and h["session"] != LOGIN and (l.inflight() or l.idle_for() < TTL) or pending(h)) \
+                    and "--force" not in args:
+                sys.exit(f"busy: held by {describe(h)}, idle {l.idle_for()}s — retry shortly or use --force")
+            if pid:
+                kill(pid)
+                on_closed(b)
+            before_launch(b)
+            l.holder = {"session": LOGIN, "since": now()}
+            urls = [a for a in args if not a.startswith("--")]
+            # Same cookie encryption as the Playwright-launched Chrome (mock keychain), but no CDP/automation.
+            # Agent Chrome (same build as the servers), not Google Chrome.app: macOS would mistake this window
+            # for the user's own Chrome.
+            subprocess.Popen([agent_chrome(), f"--user-data-dir={profile(b)}", "--use-mock-keychain",
+                              "--password-store=basic", "--no-first-run", "--no-default-browser-check", *urls],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    if cmd == "login":
+        arm_reaper(b)
+        print("login window open — sign in, tick \"keep me signed in\", then quit that Chrome window (Cmd-Q)")
+        return
+    sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

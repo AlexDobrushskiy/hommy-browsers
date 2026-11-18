@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array><string>__HB_HOME__/agent-chrome</string><string>refresh</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>__HOME__</string>
+    <key>PATH</key><string>__PATH__</string>
+    <key>HB_HOME</key><string>__HB_HOME__</string>
+    <key>HB_CONFIG</key><string>__CONFIG__</string>
+    <key>HB_NODE</key><string>__NODE__</string>
+  </dict>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>StandardOutPath</key><string>__STATE__/logs/agent-chrome.log</string>
+  <key>StandardErrorPath</key><string>__STATE__/logs/agent-chrome.log</string>
+</dict>
+</plist>

@@ -1,0 +1,9 @@
+#!/bin/bash
+# Captcha / bot-wall solver for agent browsers (opt-in: install.sh --with-captcha). Docs: captcha/README.md
+set -u
+# shellcheck source=lib/config.sh
+source "$(dirname "$0")/lib/config.sh"
+HERE=$HB_HOME/captcha
+[ -x "$HERE/.venv/bin/python" ] || { echo "captcha-solve: not installed (run install.sh --with-captcha)" >&2; exit 1; }
+export CAPTCHA_STATE_DIR="$HB_STATE_DIR/captcha"
+PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" exec "$HERE/.venv/bin/python" -m captcha_solver.cli "$@"

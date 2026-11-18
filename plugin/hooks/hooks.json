@@ -1,0 +1,23 @@
+{
+  "description": "Identity lease: one holder per identity browser (pw-identity hook pre|post)",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__(plugin_hommy-browsers_)?identity(-[a-d])?__.*",
+        "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/lease\" pre", "timeout": 15 }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__(plugin_hommy-browsers_)?identity(-[a-d])?__.*",
+        "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/lease\" post", "timeout": 15 }]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "mcp__(plugin_hommy-browsers_)?identity(-[a-d])?__.*",
+        "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/lease\" post", "timeout": 15 }]
+      }
+    ]
+  }
+}

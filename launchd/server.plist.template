@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array><string>__HB_HOME__/serve</string><string>__NAME__</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>__HOME__</string>
+    <key>PATH</key><string>__PATH__</string>
+    <key>HB_HOME</key><string>__HB_HOME__</string>
+    <key>HB_CONFIG</key><string>__CONFIG__</string>
+    <key>HB_NODE</key><string>__NODE__</string>
+    <key>HB_ENGINE</key><string>__ENGINE__</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>__STATE__/logs/__NAME__.log</string>
+  <key>StandardErrorPath</key><string>__STATE__/logs/__NAME__.log</string>
+</dict>
+</plist>

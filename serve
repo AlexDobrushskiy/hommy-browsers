@@ -1,0 +1,46 @@
+#!/bin/bash
+# Runs one of the shared Playwright MCP servers (launchd: <HB_LABEL_PREFIX>.lanes / .identity / .identity-<x>).
+# Ports from config.env (lib/hbconfig.py ports): HB_PORT_BASE lanes, +1 identity, +2… the pool copies.
+#
+#   lanes        --isolated: every MCP connection gets its own throwaway context in one shared Chrome. No logins.
+#                Freed when the client disconnects.
+#   identity     the persistent profile HB_IDENTITY_PROFILE (the user's own sign-ins). One holder at a time: a
+#                second client gets "Browser is already in use". Hold/release is managed by the `pw-identity` hooks.
+#   identity-<x> the pool: HB_STATE_DIR/identity-pool/<x>, copies of the master made by `pw-identity seed`, kept in
+#                step by its cookie sync; one holder each, same hooks.
+#
+# All run headless on Agent Chrome (`agent-chrome`: the installed Google Chrome cloned under this install's bundle
+# id), presenting headed Chrome's User-Agent and client hints (real-chrome-ua.cjs). Each Chrome also listens on a
+# localhost debug port (HB_DEBUG_BASE layout) so `captcha-solve --lane/--identity` can attach to a tab an agent
+# opened through the MCP tools. PW_VISIBLE=1 in the plist's environment: a normal visible window instead.
+# Never Google Chrome.app directly: macOS would take the agent process for the user's own Chrome.
+set -u
+# shellcheck source=lib/config.sh
+source "$(dirname "$0")/lib/config.sh"
+NODE=${HB_NODE:-$(command -v node || true)}
+[ -x "$NODE" ] || { echo "serve: no node (set HB_NODE in config.env)" >&2; exit 1; }
+CLI="$HB_HOME/node_modules/@playwright/mcp/cli.js"
+name=${1:-}
+line=$(/usr/bin/python3 "$HB_HOME/lib/hbconfig.py" ports | awk -v n="$name" '$1 == n')
+[ -n "$name" ] && [ -n "$line" ] || { echo "usage: $0 <server> (enabled: $(/usr/bin/python3 "$HB_HOME/lib/hbconfig.py" ports | awk '{print $1}' | tr '\n' ' '))" >&2; exit 2; }
+read -r _ port debug <<<"$line"
+OUT="$HB_STATE_DIR/mcp/$name"
+RUN="$HB_STATE_DIR/run"
+mkdir -p "$OUT" "$RUN"
+CHROME="$("$HB_HOME/agent-chrome")" || exit 1
+printf '{"browser": {"launchOptions": {"args": ["--remote-debugging-port=%s"]}}}\n' "$debug" >"$RUN/mcp-$name.json"
+
+mode=(--headless --init-page "$HB_HOME/real-chrome-ua.cjs")
+caps=(--caps vision)   # coordinate mouse tools: browser_mouse_click_xy / move_xy / drag_xy (captchas, canvas UIs)
+[ "${PW_VISIBLE:-}" = 1 ] && mode=()
+
+case $name in
+  lanes)
+    exec "$NODE" "$CLI" --host 127.0.0.1 --port "$port" --allowed-hosts "127.0.0.1:$port,localhost:$port" --browser chrome --executable-path "$CHROME" --isolated "${caps[@]}" "${mode[@]}" \
+      --config "$RUN/mcp-$name.json" --output-dir "$OUT" ;;
+  identity | identity-[a-d])
+    prof=$(/usr/bin/python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import hbconfig as c; print(c.profile(c.load(), sys.argv[2]))' "$HB_HOME/lib" "$name")
+    exec "$NODE" "$CLI" --host 127.0.0.1 --port "$port" --allowed-hosts "127.0.0.1:$port,localhost:$port" --browser chrome --executable-path "$CHROME" \
+      --user-data-dir "$prof" "${caps[@]}" "${mode[@]}" \
+      --config "$RUN/mcp-$name.json" --output-dir "$OUT" ;;
+esac

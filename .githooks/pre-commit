@@ -1,0 +1,19 @@
+#!/bin/sh
+# pre-commit (core.hooksPath .githooks): the leak gate on what this commit records (master spec §9). Staged blobs and
+# path names through scripts/leak-scan.sh --staged, and gitleaks on the staged diff. Prints `path:line: leak #N
+# (category)` and gitleaks rule ids (secrets redacted), never the matched text.
+root=$(git rev-parse --show-toplevel) || exit 1
+cd "$root" || exit 1
+rc=0
+scripts/leak-scan.sh --staged . || rc=1
+if scripts/tools.sh ensure gitleaks >/dev/null; then
+  "$(scripts/tools.sh path gitleaks)" git --pre-commit --staged --redact -v --no-color --no-banner --log-level warn \
+    -c .gitleaks.toml . || rc=1
+else
+  echo "pre-commit: gitleaks unavailable (scripts/tools.sh ensure gitleaks); refusing." >&2
+  rc=1
+fi
+if [ $rc != 0 ]; then
+  echo "pre-commit: refused. Replace the real data or secret with synthetic values." >&2
+fi
+exit $rc

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""creds — site logins an agent creates and uses, stored only in the macOS Keychain.
+
+  creds new <domain>            generate a password for HB_LOGIN_EMAIL at <domain> and store it (refuses without
+                                HB_LOGIN_EMAIL, or when the item exists: `--replace` overwrites); prints the login
+  creds get <domain> [--print]  the login (exit 1: none stored); --print writes the password instead, and only to a
+                                pipe or file, never to a terminal
+  creds check <domain>          `ok` when an item exists (exit 1: `missing`)
+
+Item: Keychain service `<HB_LABEL_PREFIX>.creds.<domain>`, account = the login. The password never appears in argv,
+a file, a log or the terminal: it reaches `security` over stdin. HB_KEYCHAIN names a keychain file (tests); empty:
+the user's default keychain. Every Keychain call is non-interactive and times out instead of raising a dialog.
+"""
+import re
+import secrets
+import string
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import hbconfig  # noqa: E402
+
+DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+ALPHABET = string.ascii_letters + string.digits + "-_.!@#%+="
+TIMEOUT = 20
+
+
+def die(msg, code=1):
+    print(f"creds: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def security(args, stdin=None):
+    """Run /usr/bin/security non-interactively (stdin closed unless given, killed after TIMEOUT)."""
+    try:
+        return subprocess.run(["/usr/bin/security", *args], input=stdin, capture_output=True, text=True,
+                              timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        die("the Keychain did not answer (locked?)")
+
+
+def keychain(cfg):
+    return [cfg["HB_KEYCHAIN"]] if cfg["HB_KEYCHAIN"] else []
+
+
+def service(cfg, domain):
+    return f"{cfg['HB_LABEL_PREFIX']}.creds.{domain}"
+
+
+def find(cfg, domain):
+    """The stored login for domain, or None."""
+    r = security(["find-generic-password", "-s", service(cfg, domain), *keychain(cfg)])
+    if r.returncode != 0:
+        return None
+    m = re.search(r'"acct"<blob>="(.*)"', r.stdout)
+    return m.group(1) if m else ""
+
+
+def password():
+    while True:
+        pw = "".join(secrets.choice(ALPHABET) for _ in range(24))
+        if (any(c.islower() for c in pw) and any(c.isupper() for c in pw) and any(c.isdigit() for c in pw)
+                and any(not c.isalnum() for c in pw)):
+            return pw
+
+
+def quote(v):
+    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def store(cfg, domain, login, pw):
+    """add-generic-password through `security -i` on stdin: the password is never an argument of any process."""
+    kc = f" {quote(cfg['HB_KEYCHAIN'])}" if cfg["HB_KEYCHAIN"] else ""
+    line = (f"add-generic-password -U -s {quote(service(cfg, domain))} -a {quote(login)} -l "
+            f"{quote('hommy-browsers ' + domain)} -w {quote(pw)}{kc}\n")
+    r = security(["-i"], stdin=line)
+    if r.returncode != 0 or "error" in (r.stderr + r.stdout).lower():
+        die("could not store the item (Keychain locked or not writable)")
+
+
+def main(argv):
+    if len(argv) < 2 or argv[0] not in ("new", "get", "check"):
+        die(__doc__.strip(), 2)
+    cmd, domain, flags = argv[0], argv[1].lower(), set(argv[2:])
+    if not DOMAIN_RE.match(domain):
+        die(f"not a domain: {domain}", 2)
+    try:
+        cfg = hbconfig.load()
+    except hbconfig.ConfigError as e:
+        die(f"config: {e}", 2)
+    login = find(cfg, domain)
+    if cmd == "check":
+        print("ok" if login is not None else "missing")
+        return 0 if login is not None else 1
+    if cmd == "get":
+        if login is None:
+            die(f"nothing stored for {domain}")
+        if "--print" not in flags:
+            print(login)
+            return 0
+        if sys.stdout.isatty():
+            die("--print writes the password only to a pipe or a file, never to a terminal", 2)
+        r = security(["find-generic-password", "-s", service(cfg, domain), "-w", *keychain(cfg)])
+        if r.returncode != 0:
+            die("could not read the password")
+        sys.stdout.write(r.stdout)
+        return 0
+    # new
+    email = cfg["HB_LOGIN_EMAIL"]
+    if not email:
+        die("HB_LOGIN_EMAIL is not set in config.env: no login to register with", 2)
+    if login is not None and "--replace" not in flags:
+        die(f"{domain} already has a stored login (use --replace to overwrite)")
+    store(cfg, domain, email, password())
+    print(email)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

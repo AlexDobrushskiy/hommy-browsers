@@ -1,0 +1,28 @@
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+captcha/.venv/
+
+# Local install state: config, rendered files (all runtime state lives under HB_STATE_DIR, outside the checkout)
+/config.env
+/plugin/.mcp.json
+
+# Local dev state
+.dev/
+*.log
+*.bak*
+
+# Agent / pipeline scratch
+.lane.md
+captcha/data/grids/recaptcha/last.png
+/plugin/.hb-home

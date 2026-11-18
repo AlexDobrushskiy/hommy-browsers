@@ -1,0 +1,12 @@
+{
+  "name": "hommy-browsers",
+  "owner": { "name": "hommy" },
+  "metadata": { "description": "Shared agent browsers (Playwright MCP lanes + identity pool) for Claude Code on a Mac" },
+  "plugins": [
+    {
+      "name": "hommy-browsers",
+      "source": "./plugin",
+      "description": "The agent-browsers skill, the identity-lease hooks and the MCP registrations of this hommy-browsers install"
+    }
+  ]
+}

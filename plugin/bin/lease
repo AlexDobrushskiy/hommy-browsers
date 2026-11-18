@@ -1,0 +1,11 @@
+#!/bin/bash
+# The plugin's identity-lease hook: runs the engine's `pw-identity hook pre|post` with the hook payload on stdin.
+# The engine: the path install.sh wrote into the plugin (.hb-home; the plugin may run from Claude Code's cache copy),
+# else $HB_HOME, else the default install. No engine found: allow (exit 0) rather than block every identity call.
+plugin=$(cd "$(dirname "$0")/.." && pwd)
+for d in "$(cat "$plugin/.hb-home" 2>/dev/null)" "${HB_HOME:-}" "$HOME/.local/share/hommy-browsers"; do
+  if [[ -n $d && -x $d/pw-identity && -f $d/lib/hbconfig.py ]]; then
+    exec /usr/bin/python3 "$d/pw-identity" hook "${1:?pre|post}"
+  fi
+done
+exit 0

@@ -1,0 +1,33 @@
+{
+  "name": "hommy-browsers",
+  "version": "1.0.0",
+  "description": "Shared agent browsers: the agent-browsers skill, the identity-lease hooks and the MCP servers of the local hommy-browsers engine",
+  "license": "MIT",
+  "keywords": ["browser", "playwright", "mcp"],
+  "userConfig": {
+    "lanes_port": {
+      "type": "number",
+      "title": "Lanes port",
+      "description": "Port of the engine's lanes MCP server (config.env HB_PORT_BASE); pw-lane and pw-lane-a…d connect here",
+      "default": 8931,
+      "min": 1024,
+      "max": 65535
+    },
+    "identity_port": {
+      "type": "number",
+      "title": "Identity port",
+      "description": "Port of the engine's identity MCP server (HB_PORT_BASE + 1)",
+      "default": 8932,
+      "min": 1024,
+      "max": 65535
+    },
+    "pool": {
+      "type": "number",
+      "title": "Identity pool copies",
+      "description": "Number of identity copies (config.env HB_POOL); install.sh registers identity-a… for the engine's pool",
+      "default": 4,
+      "min": 0,
+      "max": 4
+    }
+  }
+}

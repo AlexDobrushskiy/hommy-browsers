@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Find and close leaked agent browsers.
+
+Kills only throwaway browsers: a Chrome/Chromium whose --user-data-dir is a temp
+dir (pytest, playwright temp profiles, /tmp, macOS /var/folders/.../T) and that is
+orphaned (parent is init/launchd) or older than --max-age hours.
+Everything else is reported, never killed: the user's own Chrome, this install's MCP
+lane and identity browsers (they have their own release logic), plain-chrome, named
+persistent profiles, and desktop windows opened for a human hand-off.
+
+Own-install filter: a browser belongs to this install when its app bundle carries this
+install's bundle id (HB_BUNDLE_ID) or its profile lies under HB_STATE_DIR / the identity
+profile. A browser of another install (another Agent Chrome) is never listed or touched.
+HB_REAPER_SCOPE=all (default) also lists and reaps throwaway browsers no install owns
+(a test run's leaked Chrome); HB_REAPER_SCOPE=own limits it to this install's.
+
+  browser-reaper            # dry run: list what it would close and what it leaves
+  browser-reaper --kill     # close the throwaway leaks (SIGTERM, then SIGKILL)
+  browser-reaper --json     # machine-readable list; each row has "install": own|none
+"""
+import argparse, json, os, plistlib, re, signal, subprocess, sys, time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import hbconfig  # noqa: E402
+
+BROWSER_RE = re.compile(r"(Google Chrome|Chromium|chrome-headless-shell|headless_shell|/chrome)(\s|$)")
+TEMP_RE = re.compile(r"(/var/folders/[^ ]+/T/|^/tmp/|^/private/tmp/|pytest-of-|playwright_chromiumdev_profile-|playwright-mcp-|/\.tmp)")
+APP_RE = re.compile(r"^(.+?\.app)/Contents/MacOS/")
+
+
+def etime_to_s(e: str) -> int:
+    days = 0
+    if "-" in e:
+        d, e = e.split("-", 1)
+        days = int(d)
+    parts = [int(x) for x in e.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, s = parts
+    return days * 86400 + h * 3600 + m * 60 + s
+
+
+def processes():
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,etime=,args="], capture_output=True, text=True).stdout
+    procs = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)", line)
+        if m:
+            procs[int(m[1])] = {"pid": int(m[1]), "ppid": int(m[2]), "uid": int(m[3]), "age_s": etime_to_s(m[4]),
+                                "args": m[5]}
+    return procs
+
+
+def is_init_like(pid, procs):
+    if pid <= 1:
+        return True
+    p = procs.get(pid)
+    if not p:
+        return True
+    a = p["args"]
+    return bool(re.search(r"(^|/)(launchd|systemd)(\s|$)|systemd --user", a))
+
+
+def browser_mains(procs):
+    me = os.getuid()
+    for p in procs.values():
+        if p.get("uid", me) != me:
+            continue  # another macOS user's browser: never this install's, and not ours to signal
+        a = p["args"]
+        exe = a.split(" --")[0].split(" http")[0]  # argv[0]; Chrome paths contain spaces
+        if "--type=" in a or not BROWSER_RE.search(exe) or "crashpad" in exe or re.search(r"(^|/)(node|python3?|npm)(\s|$)", exe):
+            continue
+        parent = procs.get(p["ppid"])
+        pexe = parent["args"].split(" --")[0] if parent else ""
+        if parent and BROWSER_RE.search(pexe) and "--type=" not in parent["args"]:
+            continue  # child of another browser main
+        m = re.search(r"--user-data-dir[= ](\S+)", a)
+        p["profile"] = m[1] if m else None
+        yield p
+
+
+def bundle_id(exe, cache={}):
+    """CFBundleIdentifier of the app bundle an executable lives in, or None."""
+    m = APP_RE.match(exe)
+    if not m:
+        return None
+    if m[1] not in cache:
+        try:
+            with open(m[1] + "/Contents/Info.plist", "rb") as f:
+                cache[m[1]] = plistlib.load(f).get("CFBundleIdentifier")
+        except (OSError, ValueError):
+            cache[m[1]] = None
+    return cache[m[1]]
+
+
+def owner(p, cfg):
+    """own: this install's browser; other: another install's Agent Chrome; none: no install's."""
+    exe = p["args"].split(" --")[0]
+    roots = [os.path.realpath(cfg["HB_STATE_DIR"]), os.path.realpath(cfg["HB_IDENTITY_PROFILE"])]
+    prof = os.path.realpath(p["profile"]) if p.get("profile") else ""
+    if bundle_id(exe) == cfg["HB_BUNDLE_ID"] or any(prof == r or prof.startswith(r + os.sep) for r in roots):
+        return "own"
+    if "/Agent Chrome.app/" in exe:
+        return "other"
+    return "none"
+
+
+def managed(prof, cfg):
+    """A profile this install's servers or plain-chrome manage (they have their own release logic)."""
+    real = os.path.realpath(prof)
+    for root in (hbconfig.state(cfg, "mcp"), hbconfig.state(cfg, "plain-chrome"), hbconfig.state(cfg, "identity-pool"),
+                 Path(cfg["HB_IDENTITY_PROFILE"])):
+        r = os.path.realpath(root)
+        if real == r or real.startswith(r + os.sep):
+            return True
+    return False
+
+
+def server_of(p, procs):
+    """The MCP server (`serve <name>`'s node) of this install that launched this Chrome, or None. The lanes server's
+    Chrome has a temp profile but is not a leak: it serves every lane session until its idle timeout."""
+    parent = procs.get(p["ppid"])
+    cli = os.path.realpath(hbconfig.HB_HOME / "node_modules" / "@playwright" / "mcp" / "cli.js")
+    m = re.search(r"(\S+/@playwright/mcp/cli\.js)(\s|$)", parent["args"]) if parent else None
+    if not m or os.path.realpath(m[1]) != cli:
+        return None
+    m = re.search(r"--port[= ](\d+)", parent["args"])
+    return m[1] if m else "?"
+
+
+def in_scope(inst, cfg):
+    """Listed and reaped: this install's browsers, plus unowned ones when HB_REAPER_SCOPE=all; never another's."""
+    return inst == "own" or (inst == "none" and cfg["HB_REAPER_SCOPE"] == "all")
+
+
+def classify(p, procs, max_age_s, cfg):
+    prof = p["profile"]
+    orphan = is_init_like(p["ppid"], procs)
+    if prof is None:
+        return "leave", "no --user-data-dir: a person's browser (the user's Chrome or a desktop hand-off window)"
+    port = server_of(p, procs)
+    if port:
+        return "leave", f"managed (this install's MCP server on :{port}; closes with it or after its idle timeout)"
+    if managed(prof, cfg):
+        return "leave", "managed (this install's MCP lane/identity or plain-chrome; own release logic)"
+    if TEMP_RE.search(prof):
+        if orphan:
+            return "kill", "throwaway profile, orphaned (its launcher is gone)"
+        if p["age_s"] > max_age_s:
+            return "kill", f"throwaway profile, older than {max_age_s // 3600} h"
+        return "leave", "throwaway profile, launcher still alive"
+    return "leave", "named persistent profile: its owner must close it" + (" (ORPHANED)" if orphan else "")
+
+
+def kill(pid):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "not-permitted"
+    for _ in range(20):
+        time.sleep(0.25)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "terminated"
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "terminated"
+    return "killed"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--kill", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--max-age", type=float, default=6, help="hours before a non-orphaned throwaway browser counts as leaked")
+    a = ap.parse_args()
+    try:
+        cfg = hbconfig.load()
+    except hbconfig.ConfigError as e:
+        sys.exit(f"browser-reaper: config: {e}")
+    log = hbconfig.state(cfg, "logs", "reaper-kills.log")
+    procs = processes()
+    rows = []
+    for p in browser_mains(procs):
+        inst = owner(p, cfg)
+        if not in_scope(inst, cfg):
+            continue                      # another install's browser, or out of scope: never listed or touched
+        action, why = classify(p, procs, int(a.max_age * 3600), cfg)
+        row = {"pid": p["pid"], "ppid": p["ppid"], "age_h": round(p["age_s"] / 3600, 1), "profile": p["profile"],
+               "install": inst, "server": server_of(p, procs), "action": action, "why": why}
+        if action == "kill" and a.kill:
+            row["result"] = kill(p["pid"])
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "a") as f:
+                f.write(f"{time.strftime('%F %T')} {row['result']} pid={p['pid']} age_h={row['age_h']} {p['profile']}\n")
+        rows.append(row)
+    if a.json:
+        print(json.dumps(rows, indent=1))
+        return
+    for r in rows:
+        tag = r.get("result", r["action"] if r["action"] == "leave" else "WOULD KILL")
+        print(f"{tag:11} pid={r['pid']:<8} age={r['age_h']:>6}h  {r['profile'] or '-'}  [{r['why']}]")
+    if not rows:
+        print("no browsers running")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

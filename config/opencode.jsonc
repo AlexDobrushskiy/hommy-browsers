@@ -1,0 +1,11 @@
+// Merge into ~/.config/opencode/opencode.jsonc (default ports: HB_PORT_BASE=8931; `lib/hbconfig.py ports` for yours)
+{
+  "mcp": {
+    "pw-lane": { "type": "remote", "url": "http://localhost:8931/mcp", "enabled": true },
+    "identity": { "type": "remote", "url": "http://localhost:8932/mcp", "enabled": true },
+    "identity-a": { "type": "remote", "url": "http://localhost:8933/mcp", "enabled": true },
+    "identity-b": { "type": "remote", "url": "http://localhost:8934/mcp", "enabled": true },
+    "identity-c": { "type": "remote", "url": "http://localhost:8935/mcp", "enabled": true },
+    "identity-d": { "type": "remote", "url": "http://localhost:8936/mcp", "enabled": true }
+  }
+}

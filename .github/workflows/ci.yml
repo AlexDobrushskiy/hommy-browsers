@@ -1,0 +1,150 @@
+name: ci
+
+on:
+  push:
+    branches: [main, 'ci-probe/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# hommy-browsers is macOS-only (launchd, Keychain, Agent Chrome), so CI runs on macOS. Every job's runner comes from the repo
+# variable CREW_RUNS_ON (a JSON runs-on value); unset, GitHub-hosted macos-latest. Test steps run with HOME in a
+# scratch dir under $RUNNER_TEMP, never the runner user's own. Tools come from scripts/tools.sh (pinned + SHA-256).
+# Every job first masks each identifier of the LEAK_IDENTIFIERS secret: our scripts never print a match, but third-party
+# steps do print text (actions/checkout prints the head commit's subject).
+jobs:
+  test:
+    runs-on: ${{ fromJSON(vars.CREW_RUNS_ON || '"macos-latest"') }}
+    steps:
+      - name: mask identifiers (before checkout prints commit subjects)
+        env:
+          LEAK_LIST: ${{ secrets.LEAK_IDENTIFIERS }}
+        run: |
+          printf '%s\n' "$LEAK_LIST" | while IFS=$'\t' read -r cat id; do
+            case $cat in '' | '#'*) continue ;; esac
+            [ -n "$id" ] || continue
+            # masks match exact text: the common casings, and for a phone-shaped entry its other separator forms
+            lo=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
+            up=$(printf '%s' "$id" | tr '[:lower:]' '[:upper:]')
+            cap=$(printf '%s' "${lo:0:1}" | tr '[:lower:]' '[:upper:]')${lo:1}
+            title=$(printf '%s' "$lo" | awk '{for (i = 1; i <= NF; i++) $i = toupper(substr($i, 1, 1)) substr($i, 2)} 1')
+            printf '::add-mask::%s\n' "$id" "$lo" "$up" "$cap" "$title"
+            d=$(printf '%s' "$id" | tr -cd '0-9')
+            if [ ${#d} -ge 6 ] && [ -z "$(printf '%s' "$id" | tr -d '0-9+ ().-')" ]; then
+              printf '::add-mask::%s\n' "$d" "+$d" "$(printf '%s' "$id" | tr ' ' -)" "$(printf '%s' "$id" | tr ' ' .)"
+              if [ ${#d} -ge 10 ]; then printf '::add-mask::%s\n' "${d: -9}"; fi
+            fi
+          done
+      - uses: actions/checkout@v6
+      - name: offline tests (scratch HOME)
+        run: |
+          export HOME="$RUNNER_TEMP/home"
+          rm -rf "$HOME" && mkdir -p "$HOME"
+          unset CLAUDE_CONFIG_DIR
+          scripts/ci-preflight.sh test
+
+  shellcheck:
+    runs-on: ${{ fromJSON(vars.CREW_RUNS_ON || '"macos-latest"') }}
+    steps:
+      - name: mask identifiers (before checkout prints commit subjects)
+        env:
+          LEAK_LIST: ${{ secrets.LEAK_IDENTIFIERS }}
+        run: |
+          printf '%s\n' "$LEAK_LIST" | while IFS=$'\t' read -r cat id; do
+            case $cat in '' | '#'*) continue ;; esac
+            [ -n "$id" ] || continue
+            # masks match exact text: the common casings, and for a phone-shaped entry its other separator forms
+            lo=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
+            up=$(printf '%s' "$id" | tr '[:lower:]' '[:upper:]')
+            cap=$(printf '%s' "${lo:0:1}" | tr '[:lower:]' '[:upper:]')${lo:1}
+            title=$(printf '%s' "$lo" | awk '{for (i = 1; i <= NF; i++) $i = toupper(substr($i, 1, 1)) substr($i, 2)} 1')
+            printf '::add-mask::%s\n' "$id" "$lo" "$up" "$cap" "$title"
+            d=$(printf '%s' "$id" | tr -cd '0-9')
+            if [ ${#d} -ge 6 ] && [ -z "$(printf '%s' "$id" | tr -d '0-9+ ().-')" ]; then
+              printf '::add-mask::%s\n' "$d" "+$d" "$(printf '%s' "$id" | tr ' ' -)" "$(printf '%s' "$id" | tr ' ' .)"
+              if [ ${#d} -ge 10 ]; then printf '::add-mask::%s\n' "${d: -9}"; fi
+            fi
+          done
+      - uses: actions/checkout@v6
+      - name: shellcheck (pinned; tracked sh/bash scripts)
+        run: |
+          scripts/tools.sh ensure shellcheck
+          scripts/ci-preflight.sh shellcheck
+
+  leak:
+    runs-on: ${{ fromJSON(vars.CREW_RUNS_ON || '"macos-latest"') }}
+    steps:
+      - name: mask identifiers (before checkout prints commit subjects)
+        env:
+          LEAK_LIST: ${{ secrets.LEAK_IDENTIFIERS }}
+        run: |
+          printf '%s\n' "$LEAK_LIST" | while IFS=$'\t' read -r cat id; do
+            case $cat in '' | '#'*) continue ;; esac
+            [ -n "$id" ] || continue
+            # masks match exact text: the common casings, and for a phone-shaped entry its other separator forms
+            lo=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
+            up=$(printf '%s' "$id" | tr '[:lower:]' '[:upper:]')
+            cap=$(printf '%s' "${lo:0:1}" | tr '[:lower:]' '[:upper:]')${lo:1}
+            title=$(printf '%s' "$lo" | awk '{for (i = 1; i <= NF; i++) $i = toupper(substr($i, 1, 1)) substr($i, 2)} 1')
+            printf '::add-mask::%s\n' "$id" "$lo" "$up" "$cap" "$title"
+            d=$(printf '%s' "$id" | tr -cd '0-9')
+            if [ ${#d} -ge 6 ] && [ -z "$(printf '%s' "$id" | tr -d '0-9+ ().-')" ]; then
+              printf '::add-mask::%s\n' "$d" "+$d" "$(printf '%s' "$id" | tr ' ' -)" "$(printf '%s' "$id" | tr ' ' .)"
+              if [ ${#d} -ge 10 ]; then printf '::add-mask::%s\n' "${d: -9}"; fi
+            fi
+          done
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: scanner unit tests and self-test (the tree's own scanner)
+        run: |
+          scripts/tools.sh ensure gitleaks
+          python3 -m unittest discover -s scripts/leak
+          scripts/leak-scan.sh --self-test
+      - name: leak scan (judged by origin/main's scanner, identities and gitleaks config)
+        env:
+          LEAK_LIST: ${{ secrets.LEAK_IDENTIFIERS }}
+          EVENT: ${{ github.event_name }}
+          FORK: ${{ github.event.pull_request.head.repo.fork }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: scripts/ci-leak.sh leak
+
+  identities:
+    runs-on: ${{ fromJSON(vars.CREW_RUNS_ON || '"macos-latest"') }}
+    steps:
+      - name: mask identifiers (before checkout prints commit subjects)
+        env:
+          LEAK_LIST: ${{ secrets.LEAK_IDENTIFIERS }}
+        run: |
+          printf '%s\n' "$LEAK_LIST" | while IFS=$'\t' read -r cat id; do
+            case $cat in '' | '#'*) continue ;; esac
+            [ -n "$id" ] || continue
+            # masks match exact text: the common casings, and for a phone-shaped entry its other separator forms
+            lo=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
+            up=$(printf '%s' "$id" | tr '[:lower:]' '[:upper:]')
+            cap=$(printf '%s' "${lo:0:1}" | tr '[:lower:]' '[:upper:]')${lo:1}
+            title=$(printf '%s' "$lo" | awk '{for (i = 1; i <= NF; i++) $i = toupper(substr($i, 1, 1)) substr($i, 2)} 1')
+            printf '::add-mask::%s\n' "$id" "$lo" "$up" "$cap" "$title"
+            d=$(printf '%s' "$id" | tr -cd '0-9')
+            if [ ${#d} -ge 6 ] && [ -z "$(printf '%s' "$id" | tr -d '0-9+ ().-')" ]; then
+              printf '::add-mask::%s\n' "$d" "+$d" "$(printf '%s' "$id" | tr ' ' -)" "$(printf '%s' "$id" | tr ' ' .)"
+              if [ ${#d} -ge 10 ]; then printf '::add-mask::%s\n' "${d: -9}"; fi
+            fi
+          done
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: commit identities (origin/main's .github/commit-identities)
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: scripts/ci-leak.sh identities
