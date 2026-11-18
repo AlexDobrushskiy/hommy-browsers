@@ -1,18 +1,41 @@
 #!/bin/sh
-# pre-push (core.hooksPath .githooks; every workslot shares it). 1) main changes only by merging a green PR: GitHub
-# cannot enforce this on a free private repo. 2) The leak gate on everything the push sends (master spec §9): every
-# blob, path name, commit header and message (scripts/leak-scan.sh --push), author and committer emails against
-# .github/commit-identities, and gitleaks over the pushed commits. Prints `path:line: leak #N (category)`,
-# `commit <sha12>: …` and gitleaks rule ids (redacted), never the matched text.
+# pre-push (core.hooksPath .githooks; every workslot shares it). 1) main moves only by fast-forwarding it to the head
+# of an open PR whose checks are all green (S10: GitHub's merge buttons stamp the merger's email; GitHub cannot
+# enforce this on a free private repo). Everything else to main is refused. 2) The leak gate on everything the push
+# sends (master spec §9): every blob, path name, commit header and message (scripts/leak-scan.sh --push), author and
+# committer emails against .github/commit-identities, and gitleaks over the pushed commits. Prints
+# `path:line: leak #N (category)`, `commit <sha12>: …` and gitleaks rule ids (redacted), never the matched text.
 root=$(git rev-parse --show-toplevel) || exit 1
+
+# main_ok LOCAL REMOTE: a fast-forward of main to the head of an open PR with every check SUCCESS. Prints why not.
+main_ok() {
+  case $1 in *[!0]*) ;; *) echo "deleting main"; return 1 ;; esac
+  case $2 in *[!0]*) ;; *) echo "main does not exist on the remote yet"; return 1 ;; esac
+  git merge-base --is-ancestor "$2" "$1" 2>/dev/null || { echo "not a fast-forward of main"; return 1; }
+  command -v gh >/dev/null 2>&1 || { echo "gh not found: cannot check the PR"; return 1; }
+  prs=$(gh pr list --state open --limit 200 --json number,headRefOid \
+    --jq '.[] | "\(.number) \(.headRefOid)"' </dev/null) || { echo "gh pr list failed"; return 1; }
+  pr=$(printf '%s\n' "$prs" | awk -v s="$1" '$2 == s { print $1; exit }')
+  [ -n "$pr" ] || { echo "$(printf %.12s "$1") is not the head of an open PR"; return 1; }
+  states=$(gh pr checks "$pr" --json state --jq '.[].state' </dev/null 2>/dev/null)
+  [ -n "$states" ] || { echo "PR #$pr has no checks"; return 1; }
+  bad=$(printf '%s\n' "$states" | grep -cv '^SUCCESS$')
+  [ "$bad" = 0 ] || { echo "PR #$pr: $bad check(s) not SUCCESS"; return 1; }
+  echo "PR #$pr"
+}
+
 cd "$root" || exit 1
 gl=
 if scripts/tools.sh ensure gitleaks >/dev/null; then gl=$(scripts/tools.sh path gitleaks); fi
 rc=0
 while read -r _ local_sha remote_ref remote_sha; do
   if [ "$remote_ref" = "refs/heads/main" ]; then
-    echo "pre-push: direct push to main refused. Push a branch, open a PR, merge it when CI is green." >&2
-    exit 1
+    if why=$(main_ok "$local_sha" "$remote_sha"); then
+      echo "pre-push: main fast-forwards to the green head of $why" >&2
+    else
+      echo "pre-push: push to main refused ($why). main moves only by fast-forwarding it to the head of an open PR whose checks are all green." >&2
+      exit 1
+    fi
   fi
   case $local_sha in *[!0]*) ;; *) continue ;; esac   # a delete sends nothing
   scripts/leak-scan.sh --push "$local_sha" "$remote_sha" . || rc=1
