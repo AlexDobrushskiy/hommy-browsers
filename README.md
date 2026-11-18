@@ -10,6 +10,8 @@ bundle id and ad-hoc re-signed, so sites see plain Chrome while macOS never conf
 
 ## Install
 
+[hommy](https://github.com/AlexDobrushskiy/hommy)'s one-line installer sets this up for you (stage 7). On its own:
+
 Prerequisites: Google Chrome, Node.js ≥ 20 (with npm), `uv`, `ffmpeg` (`brew install uv ffmpeg`); Ollama only for the
 captcha solver.
 
@@ -89,9 +91,27 @@ downloads), `run/` (server configs), `logs/`, `captcha/` (attempt log, screensho
 `qwen3.5:4b` through Ollama (reCAPTCHA tiles, locating elements; 3.3 GB) and `google/owlv2-base-patch16-ensemble`
 (4x4 grids; ~0.6 GB from Hugging Face). Without them the escalation ladder skips the solver rung.
 
+## Risks
+
+- **Site terms:** getting past bot walls and solving captchas can breach a site's terms of use; you decide which sites
+  your agents visit, and the solver is off unless you install it (`--with-captcha`).
+- **Your sign-ins:** the identity profile holds your real sessions; any agent that holds the identity browser acts as
+  you on those sites. Agents ask before anything that commits (pay, order, submit, send), as the skill tells them.
+- **Signing:** Agent Chrome is re-signed ad hoc on your Mac (no Developer ID); it is your own Chrome under another
+  bundle id, not a modified browser.
+
+## Uninstall
+
+`~/.local/share/hommy-browsers/install.sh --uninstall` stops and removes the services, then
+`claude plugin uninstall hommy-browsers@hommy-browsers` and `claude plugin marketplace remove hommy-browsers`, and
+`rm -rf ~/.local/share/hommy-browsers` (the checkout) and `~/.local/state/hommy-browsers` (your profiles and sign-ins)
+when you no longer want them.
+
 ## Development
 
 `scripts/ci-preflight.sh` runs CI's checks locally (offline tests in `tests/`, shellcheck, the leak gate's scanner,
 gitleaks). End-to-end runs against a scratch install: [`docs/testing.md`](docs/testing.md), [`e2e/README.md`](e2e/README.md).
 
-MIT licence.
+## License
+
+MIT, see [LICENSE](LICENSE).

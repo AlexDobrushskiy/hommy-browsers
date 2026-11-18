@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, 'ci-probe/**']
   pull_request:
+  workflow_dispatch: # the go step's GitHub-hosted run on main after the public switch (ops/go-public.sh)
 
 permissions:
   contents: read
